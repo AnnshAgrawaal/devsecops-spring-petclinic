@@ -1,0 +1,393 @@
+name: Security pipeline
+
+on:
+  push:
+    branches: ["main", "feature/**"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    # Run full scan nightly at 02:00 UTC so DAST doesn't slow every push
+    - cron: "0 2 * * *"
+
+env:
+  JAVA_VERSION: "21"
+  IMAGE_NAME: petclinic
+
+# Prevent concurrent runs on the same branch (cancel the older one)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 1 — BUILD & UNIT TEST
+  # Compiles the app, runs unit tests, and uploads the JAR as an
+  # artifact so later jobs don't need to rebuild from source.
+  # ─────────────────────────────────────────────────────────────
+  build:
+    name: Build & unit tests
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Build and run unit tests
+        run: mvn --batch-mode --no-transfer-progress verify
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          # Adjust glob if your artifact ID differs
+          path: target/*.jar
+          retention-days: 1
+
+      - name: Upload Surefire test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-report
+          path: target/surefire-reports/
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 2 — SEMGREP SAST
+  # Runs Semgrep with Java, Spring, and OWASP Top 10 rulesets.
+  # Uploads findings as SARIF to GitHub Code Scanning.
+  # Also runs OWASP Dependency-Check for known CVEs in pom.xml.
+  # ─────────────────────────────────────────────────────────────
+  sast:
+    name: SAST (Semgrep + Dependency-Check)
+    runs-on: ubuntu-22.04
+    needs: build
+
+    # Required for uploading SARIF to Code Scanning
+    permissions:
+      security-events: write
+      contents: read
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      # ── Semgrep ──────────────────────────────────────────────
+      - name: Install Semgrep
+        run: pip install semgrep --quiet
+
+      - name: Run Semgrep (OSS rulesets + custom rules)
+        # Exit code 1 = findings present → fail the pipeline.
+        # Remove --error to make Semgrep advisory-only.
+        run: |
+          semgrep scan \
+            --config p/java \
+            --config p/owasp-top-ten \
+            --config p/spring \
+            --config semgrep/custom-rules.yml \
+            --sarif \
+            --output semgrep-results.sarif \
+            --error \
+            --quiet
+        # Semgrep exits 0 (no findings) or 1 (findings found).
+        # Treat any other exit code as a scan failure.
+        continue-on-error: false
+
+      - name: Upload Semgrep SARIF to Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep-results.sarif
+          category: semgrep
+
+      - name: Upload Semgrep SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-sarif
+          path: semgrep-results.sarif
+          retention-days: 30
+
+      # ── OWASP Dependency-Check ────────────────────────────────
+      - name: Run OWASP Dependency-Check
+        run: |
+          mvn --batch-mode --no-transfer-progress \
+            org.owasp:dependency-check-maven:check \
+            -DfailBuildOnCVSS=7 \
+            -Dformats=JSON,HTML \
+            -DsuppressionFile=dependency-check-suppression.xml \
+            || true
+        # We use || true here and check results manually so the
+        # HTML report is always uploaded even on failure.
+
+      - name: Fail if CVSS >= 7 found in dependencies
+        run: |
+          VULN_COUNT=$(python3 -c "
+          import json, sys
+          with open('target/dependency-check-report.json') as f:
+              data = json.load(f)
+          high = [
+              v for d in data.get('dependencies', [])
+              for v in d.get('vulnerabilities', [])
+              if float(v.get('cvssv3', {}).get('baseScore', 0) or
+                       v.get('cvssv2', {}).get('score', 0)) >= 7
+          ]
+          print(len(high))
+          ")
+          echo "High/Critical dependency CVEs found: $VULN_COUNT"
+          if [ "$VULN_COUNT" -gt "0" ]; then
+            echo "Pipeline blocked: dependency CVEs at CVSS >= 7"
+            exit 1
+          fi
+
+      - name: Upload Dependency-Check HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: target/dependency-check-report.html
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 3 — CODEQL (deep dataflow analysis)
+  # Runs on PRs and nightly schedule only — CodeQL takes ~10 min
+  # and is too slow for every push.
+  # ─────────────────────────────────────────────────────────────
+  codeql:
+    name: CodeQL dataflow analysis
+    runs-on: ubuntu-22.04
+    needs: build
+    # Only on PRs and scheduled runs, not every push
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule'
+
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: java
+          # Extended query suite catches more issues at the cost of
+          # more false positives — tune as you build confidence.
+          queries: security-extended
+
+      - name: Build for CodeQL (autobuild)
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: codeql-java
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 4 — CONTAINER BUILD & TRIVY SCAN
+  # Builds the Docker image from the JAR produced in job 1, then
+  # scans it with Trivy for OS and library CVEs.
+  # ─────────────────────────────────────────────────────────────
+  container-scan:
+    name: Container build & Trivy scan
+    runs-on: ubuntu-22.04
+    needs: sast
+
+    permissions:
+      security-events: write
+      contents: read
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download JAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: target/
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --tag ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            --tag ${{ env.IMAGE_NAME }}:latest \
+            --file Dockerfile \
+            .
+
+      # ── Trivy filesystem scan (pom.xml / SCA) ────────────────
+      - name: Trivy — filesystem scan (SCA)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs-results.sarif
+          severity: HIGH,CRITICAL
+          # Exit 1 if HIGH or CRITICAL CVEs found in source deps
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload Trivy filesystem SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs-results.sarif
+          category: trivy-fs
+
+      # ── Trivy image scan ──────────────────────────────────────
+      - name: Trivy — image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: sarif
+          output: trivy-image-results.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          # Trivy table output for human-readable job log
+          template: "@contrib/sarif.tpl"
+
+      - name: Upload Trivy image SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image-results.sarif
+          category: trivy-image
+
+      - name: Upload Trivy reports as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-reports
+          path: |
+            trivy-fs-results.sarif
+            trivy-image-results.sarif
+          retention-days: 30
+
+      # ── Save image for DAST job ───────────────────────────────
+      - name: Export Docker image for DAST job
+        run: docker save ${{ env.IMAGE_NAME }}:latest | gzip > image.tar.gz
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: image.tar.gz
+          # Short retention — only needed for the DAST job
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 5 — DAST (OWASP ZAP)
+  # Loads the image built in job 4, starts the app with
+  # docker-compose, then runs an authenticated ZAP full scan.
+  #
+  # Key: authenticated scanning — ZAP logs in as a real user so
+  # it can find IDOR, broken auth, and post-login issues that an
+  # unauthenticated scan would miss entirely.
+  # ─────────────────────────────────────────────────────────────
+  dast:
+    name: DAST (OWASP ZAP authenticated)
+    runs-on: ubuntu-22.04
+    needs: container-scan
+
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker image
+        run: docker load < image.tar.gz
+
+      - name: Start application with docker-compose
+        run: |
+          docker-compose up -d
+          # Wait for the app to be ready (health endpoint or TCP)
+          echo "Waiting for app to start..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/actuator/health > /dev/null 2>&1; then
+              echo "App is ready after ${i}s"
+              break
+            fi
+            sleep 2
+          done
+          # Final check — fail fast if app never started
+          curl -sf http://localhost:8080/actuator/health || \
+            (docker-compose logs && exit 1)
+
+      # ── ZAP full authenticated scan ───────────────────────────
+      # Uses zaproxy/action-full-scan which runs the ZAP Docker
+      # image internally. The zap/auth.yaml context file tells ZAP
+      # how to log in (form URL, field names, logged-in indicator).
+      - name: Run ZAP authenticated full scan
+        uses: zaproxy/action-full-scan@v0.10.0
+        with:
+          target: "http://localhost:8080"
+          # ZAP context file — defines auth, scope, and exclusions
+          # See zap/auth.yaml in this repo for the full structure
+          context_file: zap/auth.yaml
+          # Alert thresholds: FAIL = pipeline fails, WARN = advisory
+          # Tune these as you understand ZAP's output for this app:
+          #   fail_action: FAIL on Medium+, WARN on Low
+          rules_file_name: zap/rules.tsv
+          # Keep ZAP from crawling logout and breaking the session
+          cmd_options: >
+            -config scanner.attackStrength=HIGH
+            -config ajaxSpider.enabled=true
+            -config ajaxSpider.maxDuration=2
+          # Upload the HTML report as an artifact
+          allow_issue_writing: false
+
+      - name: Upload ZAP HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: |
+            report_html.html
+            report_json.json
+          retention-days: 30
+
+      - name: Upload ZAP SARIF to Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: report_sarif.sarif
+          category: zap-dast
+        continue-on-error: true
+
+      - name: Tear down app
+        if: always()
+        run: docker-compose down
